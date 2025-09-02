@@ -1830,7 +1830,7 @@ tests:
       TEST_IMPORTANCE: Critical
       TEST_TIMEOUT: "30"
     test:
-    - chain: openshift-e2e-test-hypershift-qe
+    - chain: openshift-e2e-test-hypershift-qe-mgmt
     workflow: cucushift-installer-rehearse-azure-aks-hypershift-ephemeral-creds-guest
 - as: azure-aks-hypershift-etcd-disk-encryption-guest-f7
   cron: 10 6 7,16,23,30 * *
