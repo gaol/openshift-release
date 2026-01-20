@@ -25,18 +25,6 @@ if [ ! -f "${SHARED_DIR}/nested_kubeconfig" ]; then
 fi
 export KUBECONFIG="${SHARED_DIR}/nested_kubeconfig"
 
-if [ ! -f "$SHARED_DIR/image_registry.ini" ]; then
-    echo "No image registry configured"
-    exit 1
-fi
-
-DS_NAME="test-ds"
-DS_NAMESPACE="test-ds-namespace"
-IMAGE=$(cat "$SHARED_DIR/image_registry.ini" | grep "dst_image:" | cut -d ":" -f2- |tr -d " ")
-REG_USER=$(cat "$SHARED_DIR/image_registry.ini" | grep "username:" | cut -d ":" -f2- |tr -d " ")
-REG_PASS=$(cat "$SHARED_DIR/image_registry.ini" | grep "password:" | cut -d ":" -f2- |tr -d " ")
-REG_ROUTE=$(cat "$SHARED_DIR/image_registry.ini" | grep "route:" | cut -d ":" -f2- |tr -d " ")
-
 # retry_until_success <retries> <sleep_time> <function_name> [args...]
 # - retries       : max number of attempts
 # - sleep_time    : seconds between attempts
@@ -211,6 +199,60 @@ function base64_encode_auth() {
   echo -n "$username:$password" | base64
 }
 
+# Helper function to get all replace nodes from the hosted cluster
+# Returns space-separated list of node names from NodePools with Replace upgrade type
+function get_replace_nodes() {
+  # Get NodePools with Replace upgrade type from management cluster
+  local replace_nodepools
+  replace_nodepools=$(oc --kubeconfig "${SHARED_DIR}/kubeconfig" get nodepool -n "$HOSTEDCLUSTER_NAMESPACE" -o json | jq -r '.items[] | select(.spec.management.upgradeType == "Replace") | .metadata.name')
+
+  # Get all nodes from the Replace NodePools from hosted cluster
+  local all_replace_nodes=""
+  for np in $replace_nodepools; do
+    local nodes
+    nodes=$(oc get nodes -l "hypershift.openshift.io/nodePool=$np" -o jsonpath='{.items[*].metadata.name}')
+    if [ -n "$all_replace_nodes" ]; then
+      all_replace_nodes="$all_replace_nodes $nodes"
+    else
+      all_replace_nodes="$nodes"
+    fi
+  done
+
+  echo "$all_replace_nodes"
+}
+
+# Helper function to verify all auths from original pull-secret exist in a node
+# $1: node name to check
+function verify_all_original_pull_secret_auths_in_node() {
+  local node="$1"
+  echo "Verifying all auths from original pull-secret exist in node: $node"
+
+  # Get all registry:auth pairs from pull-secret in openshift-config
+  local pull_secret_data
+  pull_secret_data=$(oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+
+  # Extract all registries
+  local registries
+  registries=$(echo "$pull_secret_data" | jq -r '.auths | keys[]')
+
+  # Read config.json from the node once (outside the registry loop for efficiency)
+  local node_config_json
+  node_config_json=$(oc debug "node/$node" -q -- chroot /host cat /var/lib/kubelet/config.json)
+  if [ -z "$node_config_json" ]; then
+    echo "config.json in node $node is empty"
+    return 1
+  fi
+
+  # For each registry, verify it exists in the node's config.json
+  for registry in $registries; do
+    local expected_auth
+    expected_auth=$(echo "$pull_secret_data" | jq -r --arg reg "$registry" '.auths[$reg].auth')
+    verify_credentials_in_ps "$node_config_json" "$registry" "$expected_auth"
+  done
+
+  echo "All auths from original pull-secret verified in node: $node"
+}
+
 # Helper function to verify credentials in global-pull-secret
 # $1: registry URL
 # $2: expected auth encoded using base64(username:password)
@@ -226,6 +268,7 @@ function verify_credentials_in_global_ps() {
   fi
   verify_credentials_in_ps $global_ps $registry $expected_auth
 }
+
 
 function prepare_image_registry() {
   # make sure the namespace exists and clean
@@ -258,102 +301,123 @@ spec:
 EOF
 }
 
-# prepare image registry for the testing
-echo -e "Preparing image registry for the testing\n"
-prepare_image_registry
+nodes=$(get_replace_nodes)
 
-# make sure the namespace is deleted at the end
-trap 'oc --kubeconfig "${SHARED_DIR}/nested_kubeconfig" delete namespace "$DS_NAMESPACE"' EXIT
+# Test Case: Basic global pull secret functionality
+# Tests authentication failure, secret creation, sync, update, and deletion
+function test_basic_global_pull_secret() {
+  if [ ! -f "$SHARED_DIR/image_registry.ini" ]; then
+      echo "No image registry configured"
+      exit 1
+  fi
 
-# make sure the set up is clean
-if oc get secret "additional-pull-secret" -n "kube-system" &>/dev/null; then
-  oc delete secret "additional-pull-secret" -n "kube-system" &>/dev/null
-fi
+  DS_NAME="test-ds"
+  DS_NAMESPACE="test-ds-namespace"
+  IMAGE=$(cat "$SHARED_DIR/image_registry.ini" | grep "dst_image:" | cut -d ":" -f2- |tr -d " ")
+  REG_USER=$(cat "$SHARED_DIR/image_registry.ini" | grep "username:" | cut -d ":" -f2- |tr -d " ")
+  REG_PASS=$(cat "$SHARED_DIR/image_registry.ini" | grep "password:" | cut -d ":" -f2- |tr -d " ")
+  REG_ROUTE=$(cat "$SHARED_DIR/image_registry.ini" | grep "route:" | cut -d ":" -f2- |tr -d " ")
+  echo "=== Testing basic global pull secret functionality ==="
 
-# Check that all pods have authentication failures
-pods=$(oc get pods -l app=${DS_NAME} -n ${DS_NAMESPACE} -o jsonpath='{.items[*].metadata.name}')
-for pod in $pods; do
-  echo "Checking pod $pod for authentication failure message..."
-  retry_until_success 10 5  bash -c "oc get event --ignore-not-found -n ${DS_NAMESPACE} --field-selector involvedObject.name=$pod,involvedObject.kind=Pod -ojsonpath='{range .items[?(@.reason==\"Failed\")]}{.message}{\"\n\"}{end}' 2>&1 | grep -q 'authentication required'"
-done
-echo "All pods have the expected authentication failure message."
+  # prepare image registry for the testing
+  echo -e "Preparing image registry for the testing\n"
+  prepare_image_registry
 
-# create additional-pull-secret with reg auth, user, pass
-echo -e "Create additional-pull-secret with registry username and password\n"
-create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$REG_ROUTE" "$REG_USER" "$REG_PASS"
+  # make sure the namespace is deleted at the end
+  trap 'oc --kubeconfig "${SHARED_DIR}/nested_kubeconfig" delete namespace "$DS_NAMESPACE"' EXIT
 
-reg_registry_auth=$(base64_encode_auth "$REG_USER" "$REG_PASS")
-# there is a global-pull-secret in kube-system now, which has the reg auth
-retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system -o jsonpath='{.metadata.name}' | grep global-pull-secret"
+  # make sure the set up is clean
+  if oc get secret "additional-pull-secret" -n "kube-system" &>/dev/null; then
+    oc delete secret "additional-pull-secret" -n "kube-system" &>/dev/null
+  fi
 
-# all pods should work now
-retry_until_success 20 5 check_image_registry_pods_running
+  # Check that all pods have authentication failures
+  pods=$(oc get pods -l app=${DS_NAME} -n ${DS_NAMESPACE} -o jsonpath='{.items[*].metadata.name}')
+  for pod in $pods; do
+    echo "Checking pod $pod for authentication failure message..."
+    retry_until_success 10 5  bash -c "oc get event --ignore-not-found -n ${DS_NAMESPACE} --field-selector involvedObject.name=$pod,involvedObject.kind=Pod -ojsonpath='{range .items[?(@.reason==\"Failed\")]}{.message}{\"\n\"}{end}' 2>&1 | grep -q 'authentication required'"
+  done
+  echo "All pods have the expected authentication failure message."
 
-set +x
-# check that the reg auth is in the global-pull-secret
-verify_credentials_in_global_ps "$REG_ROUTE" "$reg_registry_auth"
+  # create additional-pull-secret with reg auth, user, pass
+  echo -e "Create additional-pull-secret with registry username and password\n"
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$REG_ROUTE" "$REG_USER" "$REG_PASS"
 
-# in all nodes, the /var/lib/kubelet/config.json file should contain reg auth
-# we only check the nodes which has the label set.
-nodes=$(oc get nodes -l 'hypershift.openshift.io/nodepool-globalps-enabled' -o jsonpath='{.items[*].metadata.name}')
-for node in $nodes; do
-  check_auth_exists_ps_node "$node" "$REG_ROUTE" "$reg_registry_auth"
-done
-set -x
+  reg_registry_auth=$(base64_encode_auth "$REG_USER" "$REG_PASS")
+  # there is a global-pull-secret in kube-system now, which has the reg auth
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system -o jsonpath='{.metadata.name}' | grep global-pull-secret"
 
-# add a new auth into additional-pull-secret
-new_auth_test_url="test-new-auth-global-ps"
-new_auth_test_user="global-ps-user"
-new_auth_test_pass="global-ps-pass"
+  # all pods should work now
+  retry_until_success 20 5 check_image_registry_pods_running
 
-new_registry_auth=$(base64_encode_auth "$new_auth_test_user" "$new_auth_test_pass")
-create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_auth_test_url" "$new_auth_test_user" "$new_auth_test_pass"
+  set +x
+  # check that the reg auth is in the global-pull-secret
+  verify_credentials_in_global_ps "$REG_ROUTE" "$reg_registry_auth"
 
-set +x
-# the new auth will be synced to global-pull-secret
-retry_until_success 10 5 verify_credentials_in_global_ps "$new_auth_test_url" "$new_registry_auth"
+  # in all nodes, the /var/lib/kubelet/config.json file should contain reg auth
+  # we only check the nodes which has the label set.
+  for node in $nodes; do
+    check_auth_exists_ps_node "$node" "$REG_ROUTE" "$reg_registry_auth"
+  done
+  set -x
 
-# the new auth will be synced to all nodes
-for node in $nodes; do
-  retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth"
-done
+  # add a new auth into additional-pull-secret
+  new_auth_test_url="test-new-auth-global-ps"
+  new_auth_test_user="global-ps-user"
+  new_auth_test_pass="global-ps-pass"
 
-# update the registry ${new_auth_test_url} with new user/pass in the additional-pull-secret
-set -x
-new_auth_test_user_2="global-ps-user-2"
-new_auth_test_pass_2="global-ps-pass-2"
+  new_registry_auth=$(base64_encode_auth "$new_auth_test_user" "$new_auth_test_pass")
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_auth_test_url" "$new_auth_test_user" "$new_auth_test_pass"
 
-new_registry_auth_2=$(base64_encode_auth "$new_auth_test_user_2" "$new_auth_test_pass_2")
-create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_auth_test_url" "$new_auth_test_user_2" "$new_auth_test_pass_2"
+  set +x
+  # the new auth will be synced to global-pull-secret
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_auth_test_url" "$new_registry_auth"
 
-set +x
-# the new auth will be synced to global-pull-secret
-retry_until_success 10 5 verify_credentials_in_global_ps "$new_auth_test_url" "$new_registry_auth_2"
+  # the new auth will be synced to all nodes
+  for node in $nodes; do
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth"
+  done
 
-# the new auth will be synced to all nodes
-for node in $nodes; do
-  retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth_2"
-done
-set -x
+  # update the registry ${new_auth_test_url} with new user/pass in the additional-pull-secret
+  set -x
+  new_auth_test_user_2="global-ps-user-2"
+  new_auth_test_pass_2="global-ps-pass-2"
 
-# delete the global-pull-secret, it will get created again
-delete_global_ps
-retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system -o jsonpath={.metadata.name} | grep global-pull-secret"
+  new_registry_auth_2=$(base64_encode_auth "$new_auth_test_user_2" "$new_auth_test_pass_2")
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_auth_test_url" "$new_auth_test_user_2" "$new_auth_test_pass_2"
 
-# delete the additional-pull-secret, all will be deleted
-oc delete secret additional-pull-secret -n kube-system
-retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+  set +x
+  # the new auth will be synced to global-pull-secret
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_auth_test_url" "$new_registry_auth_2"
 
-# in each node, there is no more auth added here.
-set +x
-for node in $nodes; do
-  retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$REG_ROUTE" "$reg_registry_auth"
-  retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth_2"
-done
+  # the new auth will be synced to all nodes
+  for node in $nodes; do
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth_2"
+  done
+  set -x
+
+  # delete the global-pull-secret, it will get created again
+  delete_global_ps
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system -o jsonpath={.metadata.name} | grep global-pull-secret"
+
+  # delete the additional-pull-secret, all will be deleted
+  oc delete secret additional-pull-secret -n kube-system
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+
+  # in each node, there is no more auth added here.
+  set +x
+  for node in $nodes; do
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$REG_ROUTE" "$reg_registry_auth"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$new_auth_test_url" "$new_registry_auth_2"
+  done
+  set -x
+
+  echo "Basic global pull secret test completed successfully"
+}
 
 ## Test cases for the original pull secret and additional-pull-secret merging with or without conflicts
-# NOTE: now the additional-pull-secret has been deleted
-# In each test case it will create one and clean it up at the end.
+# NOTE: The basic test (if run) cleans up additional-pull-secret at the end
+# Each test case below will create its own additional-pull-secret and clean it up
 
 # Test Case: Update additional-pull-secret which conflicts with original pull secret
 function test_update_additional_pull_secret_with_conflicts() {
@@ -375,6 +439,7 @@ function test_update_additional_pull_secret_with_conflicts() {
   # Cleanup
   oc delete secret additional-pull-secret -n kube-system
   retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+  retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$existing_registry" "$(base64_encode_auth "$fake_user" "$fake_pass")"
   echo "Precedence test completed successfully"
 }
 
@@ -644,6 +709,429 @@ function test_new_inplace_replace_upgrade_nodes_before_additional_pull_secret() 
   echo "Testing of Inplace/Replace upgrade strategry before creating additional-pull-secret has completed successfully"
 }
 
+# Test Case: Update additional-pull-secret first, then directly modify node config.json
+# Tests that non-conflicting manual changes are preserved, while conflicting ones are reverted
+function test_update_in_node_directly_after_additional_ps() {
+  echo "=== Testing direct node config.json modification after additional-pull-secret update ==="
+
+  # Get replace nodes from the hosted cluster
+  local replace_nodes
+  replace_nodes=$(get_replace_nodes)
+  echo "Found replace nodes: $replace_nodes"
+
+  # First, create additional-pull-secret with a new auth
+  local new_registry="test-direct-node-update.com" new_user="test-user-node" new_pass="test-pass-node" test_new_registry_auth
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_registry" "$new_user" "$new_pass"
+  echo "Created additional-pull-secret with new registry: $new_registry"
+  test_new_registry_auth=$(base64_encode_auth "$new_user" "$new_pass")
+
+  # Wait until the new registry has been synced to global-pull-secret and nodes
+  set +x
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_registry" "$test_new_registry_auth"
+  for node in $replace_nodes; do
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+  done
+  set -x
+
+  # Now directly modify the config.json in each node
+  # Add two auths: one non-conflicting (should be preserved), one conflicting (should be reverted)
+  local non_conflict_registry="manual-registry-no-conflict.com"
+  local non_conflict_user="manual-user"
+  local non_conflict_pass="manual-pass"
+  local non_conflict_auth=$(base64_encode_auth "$non_conflict_user" "$non_conflict_pass")
+
+  local conflict_user="conflicting-user"
+  local conflict_pass="conflicting-pass"
+  local conflict_auth=$(base64_encode_auth "$conflict_user" "$conflict_pass")
+
+  for node in $replace_nodes; do
+    echo "Directly modifying config.json in node: $node"
+    # Read current config, add two new auths
+    oc debug "node/$node" -q -- chroot /host bash -c "
+CONFIG_FILE=\"/var/lib/kubelet/config.json\"
+# Read current config
+CURRENT_CONFIG=\$(cat \$CONFIG_FILE)
+# Add non-conflicting auth
+UPDATED_CONFIG=\$(echo \"\$CURRENT_CONFIG\" | jq '.auths[\"$non_conflict_registry\"] = {\"auth\": \"$non_conflict_auth\"}')
+# Add conflicting auth for the registry from additional-pull-secret
+UPDATED_CONFIG=\$(echo \"\$UPDATED_CONFIG\" | jq '.auths[\"$new_registry\"] = {\"auth\": \"$conflict_auth\"}')
+# Write back
+echo \"\$UPDATED_CONFIG\" > \$CONFIG_FILE
+"
+    echo "Modified config.json in node: $node"
+  done
+
+  # Wait a bit for the system to detect the change
+  sleep 10
+
+  set +x
+  # Verify that non-conflicting auth is preserved in nodes
+  for node in $replace_nodes; do
+    echo "Checking that non-conflicting auth is preserved in node: $node"
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+
+  # Verify that the conflicting auth is reverted back to the original from additional-pull-secret
+  for node in $replace_nodes; do
+    echo "Checking that conflicting auth is reverted to additional-pull-secret value in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Cleanup - Test disaster recovery by deleting config.json
+  echo "Testing disaster recovery by deleting /var/lib/kubelet/config.json on all nodes"
+  for node in $replace_nodes; do
+    echo "Deleting config.json in node: $node"
+    oc debug "node/$node" -q -- chroot /host rm -f /var/lib/kubelet/config.json
+  done
+
+  # Wait for the file to be recreated
+  sleep 10
+
+  set +x
+  # Verify the file is recreated and doesn't contain non-conflicting manual auth (it should be gone)
+  for node in $replace_nodes; do
+    echo "Checking that non-conflicting manual auth is NOT in recreated config.json in node: $node"
+    retry_until_success 30 5 check_auth_not_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+  done
+
+  # Verify the file contains the auth from additional-pull-secret (it should be restored)
+  for node in $replace_nodes; do
+    echo "Checking that auth from additional-pull-secret IS in recreated config.json in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Delete the additional-pull-secret
+  if oc get secret additional-pull-secret -n kube-system &>/dev/null; then
+    oc delete secret additional-pull-secret -n kube-system
+  fi
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+
+  # Wait a bit for changes to propagate
+  sleep 10
+
+  set +x
+  # Verify the config.json doesn't have any of the manually added items
+  for node in $replace_nodes; do
+    echo "Verifying all manually added auths are gone from node: $node"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  echo "Direct node update after additional-pull-secret test completed successfully"
+}
+
+# Test Case: Directly modify node config.json first, then update additional-pull-secret
+# Tests the reverse order to verify reconciliation behavior
+function test_update_in_node_directly_before_additional_ps() {
+  echo "=== Testing direct node config.json modification before additional-pull-secret update ==="
+
+  # Get replace nodes from the hosted cluster
+  local replace_nodes
+  replace_nodes=$(get_replace_nodes)
+  echo "Found replace nodes: $replace_nodes"
+
+  # First, directly modify the config.json in each node
+  # Add two auths: one that will not conflict, one that will conflict with future additional-pull-secret
+  local non_conflict_registry="manual-registry-no-conflict2.com"
+  local non_conflict_user="manual-user2"
+  local non_conflict_pass="manual-pass2"
+  local non_conflict_auth=$(base64_encode_auth "$non_conflict_user" "$non_conflict_pass")
+
+  local future_registry="test-direct-node-update2.com"
+  local manual_user="manual-conflicting-user"
+  local manual_pass="manual-conflicting-pass"
+  local manual_auth=$(base64_encode_auth "$manual_user" "$manual_pass")
+
+  for node in $replace_nodes; do
+    echo "Directly modifying config.json in node: $node"
+    oc debug "node/$node" -q -- chroot /host bash -c "
+CONFIG_FILE=\"/var/lib/kubelet/config.json\"
+# Read current config
+CURRENT_CONFIG=\$(cat \$CONFIG_FILE)
+# Add non-conflicting auth
+UPDATED_CONFIG=\$(echo \"\$CURRENT_CONFIG\" | jq '.auths[\"$non_conflict_registry\"] = {\"auth\": \"$non_conflict_auth\"}')
+# Add auth that will conflict with future additional-pull-secret
+UPDATED_CONFIG=\$(echo \"\$UPDATED_CONFIG\" | jq '.auths[\"$future_registry\"] = {\"auth\": \"$manual_auth\"}')
+# Write back
+echo \"\$UPDATED_CONFIG\" > \$CONFIG_FILE
+"
+    echo "Modified config.json in node: $node"
+  done
+
+  # Wait a bit
+  sleep 10
+
+  set +x
+  # Verify the manual changes are present
+  for node in $replace_nodes; do
+    echo "Verifying manual changes are present in node: $node"
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$future_registry" "$manual_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Now create additional-pull-secret with auth for future_registry (conflicting)
+  local new_user="test-user-node2" new_pass="test-pass-node2" test_new_registry_auth
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$future_registry" "$new_user" "$new_pass"
+  echo "Created additional-pull-secret with registry: $future_registry"
+  test_new_registry_auth=$(base64_encode_auth "$new_user" "$new_pass")
+
+  # Wait until the new registry has been synced to global-pull-secret
+  set +x
+  retry_until_success 10 5 verify_credentials_in_global_ps "$future_registry" "$test_new_registry_auth"
+
+  # Verify that non-conflicting auth is still preserved in nodes
+  for node in $replace_nodes; do
+    echo "Checking that non-conflicting auth is still preserved in node: $node"
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+
+  # Verify that the conflicting auth is replaced with the one from additional-pull-secret
+  for node in $replace_nodes; do
+    echo "Checking that conflicting auth is replaced with additional-pull-secret value in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$future_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Cleanup - Test disaster recovery by deleting config.json
+  echo "Testing disaster recovery by deleting /var/lib/kubelet/config.json on all nodes"
+  for node in $replace_nodes; do
+    echo "Deleting config.json in node: $node"
+    oc debug "node/$node" -q -- chroot /host rm -f /var/lib/kubelet/config.json
+  done
+
+  # Wait for the file to be recreated
+  sleep 10
+
+  set +x
+  # Verify the file is recreated and doesn't contain non-conflicting manual auth (it should be gone)
+  for node in $replace_nodes; do
+    echo "Checking that non-conflicting manual auth is NOT in recreated config.json in node: $node"
+    retry_until_success 30 5 check_auth_not_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+  done
+
+  # Verify the file contains the auth from additional-pull-secret (it should be restored)
+  for node in $replace_nodes; do
+    echo "Checking that auth from additional-pull-secret IS in recreated config.json in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$future_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Delete the additional-pull-secret
+  if oc get secret additional-pull-secret -n kube-system &>/dev/null; then
+    oc delete secret additional-pull-secret -n kube-system
+  fi
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+
+  # Wait a bit for changes to propagate
+  sleep 10
+
+  set +x
+  # Verify the config.json doesn't have any of the manually added items
+  for node in $replace_nodes; do
+    echo "Verifying all manually added auths are gone from node: $node"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$non_conflict_registry" "$non_conflict_auth"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$future_registry" "$test_new_registry_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  echo "Direct node update before additional-pull-secret test completed successfully"
+}
+
+# Test Case: Corrupted config.json recovery
+# Tests that the system can recover from various types of corrupted config.json files
+function test_corrupted_config_json_recovery() {
+  echo "=== Testing recovery from corrupted config.json files ==="
+
+  # Get replace nodes from the hosted cluster
+  local replace_nodes
+  replace_nodes=$(get_replace_nodes)
+  echo "Found replace nodes: $replace_nodes"
+
+  # Create additional-pull-secret with a new auth
+  local new_registry="test-corrupted-recovery.com" new_user="test-user-corrupt" new_pass="test-pass-corrupt" test_new_registry_auth
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_registry" "$new_user" "$new_pass"
+  echo "Created additional-pull-secret with new registry: $new_registry"
+  test_new_registry_auth=$(base64_encode_auth "$new_user" "$new_pass")
+
+  # Wait until the new registry has been synced to global-pull-secret and nodes
+  set +x
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_registry" "$test_new_registry_auth"
+  for node in $replace_nodes; do
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+  done
+  set -x
+
+  # Test corruption type 1: Invalid JSON syntax
+  echo "Testing recovery from invalid JSON syntax on all nodes"
+  for node in $replace_nodes; do
+    echo "Corrupting config.json with invalid JSON in node: $node"
+    oc debug "node/$node" -q -- chroot /host bash -c "echo '{invalid json syntax here' > /var/lib/kubelet/config.json"
+  done
+
+  # Wait for the system to detect and fix the corruption
+  sleep 15
+
+  set +x
+  # Verify all nodes have been fixed and contain the correct auth
+  for node in $replace_nodes; do
+    echo "Verifying invalid JSON has been fixed in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Test corruption type 2: Valid JSON but missing .auths field
+  echo "Testing recovery from missing .auths field on all nodes"
+  for node in $replace_nodes; do
+    echo "Corrupting config.json with missing .auths field in node: $node"
+    oc debug "node/$node" -q -- chroot /host bash -c "echo '{}' > /var/lib/kubelet/config.json"
+  done
+
+  # Wait for the system to detect and fix the corruption
+  sleep 15
+
+  set +x
+  # Verify all nodes have been fixed and contain the correct auth
+  for node in $replace_nodes; do
+    echo "Verifying missing .auths field has been fixed in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Test corruption type 3: Valid JSON but wrong structure
+  echo "Testing recovery from wrong JSON structure on all nodes"
+  for node in $replace_nodes; do
+    echo "Corrupting config.json with completely wrong structure in node: $node"
+    oc debug "node/$node" -q -- chroot /host bash -c "echo '{\"wrong\": \"structure\", \"no\": \"auths\"}' > /var/lib/kubelet/config.json"
+  done
+
+  # Wait for the system to detect and fix the corruption
+  sleep 15
+
+  set +x
+  # Verify all nodes have been fixed and contain the correct auth
+  for node in $replace_nodes; do
+    echo "Verifying wrong JSON structure has been fixed in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Cleanup
+  if oc get secret additional-pull-secret -n kube-system &>/dev/null; then
+    oc delete secret additional-pull-secret -n kube-system
+  fi
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+
+  # Verify the config.json doesn't have any of the manually added items
+  set +x
+  for node in $replace_nodes; do
+    echo "Verifying all manually added auths are gone from node: $node"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  echo "Corrupted config.json recovery test completed successfully"
+}
+
+# Test Case: Complete disaster recovery
+# Tests recovery when both global-pull-secret and all node config.json files are deleted
+function test_complete_disaster_recovery() {
+  echo "=== Testing complete disaster recovery (delete global-pull-secret and all node config.json files) ==="
+
+  # Get replace nodes from the hosted cluster
+  local replace_nodes
+  replace_nodes=$(get_replace_nodes)
+  echo "Found replace nodes: $replace_nodes"
+
+  # Create additional-pull-secret with a new auth
+  local new_registry="test-disaster-recovery.com" new_user="test-user-disaster" new_pass="test-pass-disaster" test_new_registry_auth
+  create_or_update_pull_secret "additional-pull-secret" "kube-system" "${SHARED_DIR}/nested_kubeconfig" "$new_registry" "$new_user" "$new_pass"
+  echo "Created additional-pull-secret with new registry: $new_registry"
+  test_new_registry_auth=$(base64_encode_auth "$new_user" "$new_pass")
+
+  # Wait until everything is synced
+  set +x
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_registry" "$test_new_registry_auth"
+  for node in $replace_nodes; do
+    retry_until_success 10 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+  done
+  set -x
+
+  # Complete disaster: Delete everything except additional-pull-secret
+  echo "Simulating complete disaster: deleting global-pull-secret and all node config.json files"
+
+  # Delete global-pull-secret
+  delete_global_ps
+  echo "Deleted global-pull-secret"
+
+  # Delete config.json on all replace nodes
+  for node in $replace_nodes; do
+    echo "Deleting config.json in node: $node"
+    oc debug "node/$node" -q -- chroot /host rm -f /var/lib/kubelet/config.json
+  done
+
+  # Wait for complete recovery
+  sleep 15
+
+  set +x
+  # Verify global-pull-secret gets recreated
+  echo "Verifying global-pull-secret is recreated"
+  retry_until_success 20 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system -o jsonpath='{.metadata.name}' | grep global-pull-secret"
+
+  # Verify the recreated global-pull-secret has the correct content
+  echo "Verifying recreated global-pull-secret has correct content"
+  retry_until_success 10 5 verify_credentials_in_global_ps "$new_registry" "$test_new_registry_auth"
+
+  # Verify all node config.json files are recreated with correct content
+  for node in $replace_nodes; do
+    echo "Verifying config.json is recreated with correct content in node: $node"
+    retry_until_success 30 5 check_auth_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 30 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  set -x
+
+  # Cleanup
+  if oc get secret additional-pull-secret -n kube-system &>/dev/null; then
+    oc delete secret additional-pull-secret -n kube-system
+  fi
+  retry_until_success 10 5 bash -c "oc get --ignore-not-found secret global-pull-secret -n kube-system --no-headers | grep -q '^' || echo \"0\""
+  # Verify the config.json doesn't have any of the manually added items
+  set +x
+  for node in $replace_nodes; do
+    echo "Verifying all manually added auths are gone from node: $node"
+    retry_until_success 10 5 check_auth_not_exists_ps_node "$node" "$new_registry" "$test_new_registry_auth"
+    retry_until_success 10 5 verify_all_original_pull_secret_auths_in_node "$node"
+  done
+  echo "Complete disaster recovery test completed successfully"
+}
+
+# make sure we are using the hosted cluster kubeconfig
+export KUBECONFIG="${SHARED_DIR}/nested_kubeconfig"
+
+# If a specific test function is provided as argument, run only that function and exit
+if [ $# -gt 0 ]; then
+  echo "Running specific test function: $1"
+  "$1"
+  exit $?
+fi
+
+echo -e "\n=== Running basic global pull secret test ===\n"
+test_basic_global_pull_secret
+
 # Run additional-pull-secret update tests
 echo "=== Running tests of updating additional-pull-secret ==="
 echo -e "\nRunning test_update_additional_pull_secret_with_conflicts \n"
@@ -664,6 +1152,20 @@ test_new_node_pools_inplace_replace_upgrade
 
 echo -e "\n=== Running test_new_inplace_replace_upgrade_nodes_before_additional_pull_secret ===\n"
 test_new_inplace_replace_upgrade_nodes_before_additional_pull_secret
+
+# Run direct node modification tests
+echo -e "\n=== Running test_update_in_node_directly_after_additional_ps ===\n"
+test_update_in_node_directly_after_additional_ps
+
+echo -e "\n=== Running test_update_in_node_directly_before_additional_ps ===\n"
+test_update_in_node_directly_before_additional_ps
+
+# Run disaster recovery tests
+echo -e "\n=== Running test_corrupted_config_json_recovery ===\n"
+test_corrupted_config_json_recovery
+
+echo -e "\n=== Running test_complete_disaster_recovery ===\n"
+test_complete_disaster_recovery
 
 echo -e "Nodes Status:\n"
 oc --kubeconfig "${SHARED_DIR}/nested_kubeconfig" get nodes
